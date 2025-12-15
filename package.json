@@ -8,7 +8,9 @@
   },
   "dependencies": {
     "@azure/cosmos": "^4.9.0",
+    "axios": "^1.13.2",
     "bcryptjs": "^3.0.3",
-    "jsonwebtoken": "^9.0.3"
+    "jsonwebtoken": "^9.0.3",
+    "uuid": "^13.0.0"
   }
 }
