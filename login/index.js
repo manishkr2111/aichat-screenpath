@@ -75,9 +75,16 @@ module.exports = async function (context, req) {
             return;
         }
 
+        user.tokenVersion = (user.tokenVersion || 0) + 1;
+        await usersContainer.items.upsert(user);
         // Generate JWT token (expires in 1 day)
         const token = jwt.sign(
-            { id: user.id, name: user.name, email: user.email },
+            {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                tokenVersion: user.tokenVersion
+            },
             JWT_SECRET,
             { expiresIn: "1d" }
         );
