@@ -1,7 +1,7 @@
 const verifyToken = require('../src/verifyToken');
 
 module.exports = async function (context, req) {
-    const user = await verifyToken(req); // ✅ AWAIT added
+    const user = await verifyToken(req);
 
     if (!user) {
         context.res = {
