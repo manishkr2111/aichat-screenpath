@@ -1,7 +1,7 @@
 const { getContainer } = require('../db');
 const axios = require('axios');
 const crypto = require('crypto');
-
+const verifyToken = require('../src/verifyToken'); // ✅ Import your JWT verifier
 /* ------------------ ENV ------------------ */
 
 const MESSAGE_CONTAINER = process.env.COSMOS_MESSAGE_CONTAINER;
@@ -59,6 +59,14 @@ async function createEmbedding(text) {
 
 module.exports = async function (context, req) {
     try {
+        const user = await verifyToken(req);
+        if (!user) {
+            context.res = {
+                status: 401,
+                body: { message: "Unauthorized. Invalid or missing token." }
+            };
+            return;
+        }
         const { userId, message } = req.body || {};
 
         if (!userId || !message) {
