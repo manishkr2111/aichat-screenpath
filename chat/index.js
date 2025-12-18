@@ -31,7 +31,6 @@ function extractTextFromResponse(data) {
 
 /* ================== FAST FACT DETECTION ================== */
 
-// cheap + fast (NO AI)
 function isLikelyFact(message) {
     return /i am|i'm|i like|i love|i hate|vegetarian|vegan|allergic|diet|avoid|preference/i
         .test(message.toLowerCase());
@@ -77,9 +76,69 @@ async function saveMemoryBackground(userId, message, aiResponse) {
     }
 }
 
-/* ================== READ MEMORY (FAST) ================== */
+/* ================== VECTOR SEARCH (NEW!) ================== */
 
-async function getUserFacts(userId) {
+async function vectorSearchMemory(userId, queryText, category = null, limit = 5) {
+    const memoryContainer = getContainer(MEMORY_CONTAINER);
+
+    // Generate embedding for the query
+    const queryEmbedding = await generateEmbedding(queryText);
+
+    // Build query with optional category filter
+    let query = `
+        SELECT TOP @limit 
+            c.userMessage, 
+            c.aiResponse,
+            c.memoryCategory,
+            VectorDistance(c.embedding, @embedding) AS similarityScore
+        FROM c
+        WHERE c.userId = @userId
+    `;
+
+    const parameters = [
+        { name: "@userId", value: userId },
+        { name: "@embedding", value: queryEmbedding },
+        { name: "@limit", value: limit }
+    ];
+
+    if (category) {
+        query += ` AND c.memoryCategory = @category`;
+        parameters.push({ name: "@category", value: category });
+    }
+
+    query += ` ORDER BY VectorDistance(c.embedding, @embedding)`;
+
+    const { resources } = await memoryContainer.items.query({
+        query,
+        parameters
+    }).fetchAll();
+
+    return resources;
+}
+
+/* ================== READ MEMORY (ENHANCED WITH VECTOR SEARCH) ================== */
+
+async function getUserFacts(userId, currentMessage) {
+    // Use vector search to find RELEVANT facts based on current message
+    const results = await vectorSearchMemory(userId, currentMessage, "fact", 5);
+
+    return results.length
+        ? results.map(r => `- ${r.userMessage} (relevance: ${(1 - r.similarityScore).toFixed(2)})`).join("\n")
+        : "None";
+}
+
+async function getRelevantContext(userId, currentMessage) {
+    // Use vector search to find RELEVANT past conversations
+    const results = await vectorSearchMemory(userId, currentMessage, "conversation", 3);
+
+    return results.length
+        ? results.map(r => `- ${r.userMessage} → ${r.aiResponse}`).join("\n")
+        : "None";
+}
+
+/* ================== FALLBACK: GET ALL FACTS (OPTIONAL) ================== */
+
+async function getAllUserFacts(userId) {
     const memoryContainer = getContainer(MEMORY_CONTAINER);
 
     const { resources } = await memoryContainer.items.query({
@@ -88,32 +147,12 @@ async function getUserFacts(userId) {
             WHERE c.userId = @userId
             AND c.memoryCategory = "fact"
             ORDER BY c.createdAt DESC
-            OFFSET 0 LIMIT 5
         `,
         parameters: [{ name: "@userId", value: userId }]
     }).fetchAll();
 
     return resources.length
         ? resources.map(r => `- ${r.userMessage}`).join("\n")
-        : "None";
-}
-
-async function getRecentConversation(userId) {
-    const memoryContainer = getContainer(MEMORY_CONTAINER);
-
-    const { resources } = await memoryContainer.items.query({
-        query: `
-            SELECT c.userMessage, c.aiResponse FROM c
-            WHERE c.userId = @userId
-            AND c.memoryCategory = "conversation"
-            ORDER BY c.createdAt DESC
-            OFFSET 0 LIMIT 3
-        `,
-        parameters: [{ name: "@userId", value: userId }]
-    }).fetchAll();
-
-    return resources.length
-        ? resources.map(r => `- ${r.userMessage} → ${r.aiResponse}`).join("\n")
         : "None";
 }
 
@@ -133,23 +172,24 @@ module.exports = async function (context, req) {
             return;
         }
 
-        /* PARALLEL READS */
+        /* PARALLEL VECTOR SEARCHES - NOW CONTEXT-AWARE! */
         const [facts, recentContext] = await Promise.all([
-            getUserFacts(userId),
-            getRecentConversation(userId)
+            getUserFacts(userId, message),
+            getRelevantContext(userId, message)
         ]);
 
         const prompt = `
             You are a helpful AI assistant.
 
-            USER FACTS (always follow):
+            RELEVANT USER FACTS (from semantic search):
             ${facts}
 
-            RECENT CONTEXT:
+            RELEVANT PAST CONTEXT (from semantic search):
             ${recentContext}
 
             Rules:
             - Always respect diet & preferences
+            - Use the relevant context above to provide personalized responses
 
             User:
             ${message}
@@ -178,7 +218,8 @@ module.exports = async function (context, req) {
             status: 200,
             body: {
                 success: true,
-                data: aiResponse
+                meggase:"response received successfully",
+                data: aiResponse,
             }
         };
 
