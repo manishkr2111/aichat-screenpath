@@ -53,7 +53,7 @@ module.exports = async function (context, req) {
             query: "SELECT * FROM c WHERE c.email = @email",
             parameters: [{ name: "@email", value: email }]
         };
-        
+
         const { resources: existingUsers } = await usersContainer.items.query(querySpec).fetchAll();
 
         if (existingUsers.length > 0) {
@@ -69,33 +69,38 @@ module.exports = async function (context, req) {
         const hashedPassword = await bcrypt.hash(password, salt);
 
         // Create new user
+        // Get max id
+        const queryMaxId = {
+            query: "SELECT VALUE MAX(c.id) FROM c"
+        };
+        const { resources: maxIdResult } = await usersContainer.items.query(queryMaxId).fetchAll();
+        let newId = 1;
+        if (maxIdResult[0]) {
+            newId = parseInt(maxIdResult[0]) + 1;
+        }
+
+        // Create new user
         const newUser = {
-            id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            id: newId.toString(), // Cosmos DB id must be string
             name,
             email,
             password: hashedPassword,
             createdAt: new Date().toISOString()
         };
 
+
         // Save to database
         const { resource: createdUser } = await usersContainer.items.create(newUser);
-
-        // Generate JWT token
-        const token = jwt.sign(
-            { id: createdUser.id, name: createdUser.name, email: createdUser.email },
-            JWT_SECRET,
-            { expiresIn: "1d" }
-        );
 
         context.res = {
             status: 201,
             body: {
+                success: true,
                 message: "User registered successfully",
-                token,
-                user: { 
-                    id: createdUser.id, 
-                    name: createdUser.name, 
-                    email: createdUser.email 
+                user: {
+                    id: createdUser.id,
+                    name: createdUser.name,
+                    email: createdUser.email,
                 }
             }
         };
@@ -104,9 +109,9 @@ module.exports = async function (context, req) {
         context.log('Register error:', err);
         context.res = {
             status: 500,
-            body: { 
-                message: "Internal server error", 
-                error: err.message 
+            body: {
+                message: "Internal server error",
+                error: err.message
             }
         };
     }

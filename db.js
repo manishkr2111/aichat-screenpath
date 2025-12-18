@@ -4,9 +4,9 @@ const endpoint = process.env.COSMOS_DB_ENDPOINT;
 const key = process.env.COSMOS_DB_KEY;
 const databaseId = process.env.COSMOS_DB_NAME;
 
-console.log('DB Config:');
-console.log('Endpoint:', endpoint);
-console.log('Database:', databaseId);
+// console.log('DB Config:');
+// console.log('Endpoint:', endpoint);
+// console.log('Database:', databaseId);
 
 const client = new CosmosClient({ endpoint, key });
 const database = client.database(databaseId);
