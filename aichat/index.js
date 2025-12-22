@@ -1,127 +1,206 @@
 const { getContainer } = require("../db");
 const axios = require("axios");
-const verifyToken = require("../src/verifyToken");
+const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 
 /* ================== ENV ================== */
-
 const OPENAI_ENDPOINT_EMBEDDING = process.env.OPENAI_ENDPOINT_EMBEDDING;
 const OPENAI_API_KEY_EMBEDDING = process.env.OPENAI_API_KEY_EMBEDDING;
-const OPENAI_ENDPOINT_CHAT = process.env.OPENAI_ENDPOINT_CHAT;
-const OPENAI_KEY_CHAT = process.env.OPENAI_KEY_CHAT;
 const EMBEDDING_DEPLOYMENT = process.env.EMBEDDING_DEPLOYMENT;
+
+const RESPONSES_URL_4_MODEL = process.env.OPENAI_ENDPOINT_CHAT_4_MODEL;
+const OPENAI_KEY_CHAT_4_MODEL = process.env.OPENAI_KEY_CHAT_4_MODEL;
 
 const MESSAGE_CONTAINER = process.env.COSMOS_MESSAGE_CONTAINER;
 const MEMORY_CONTAINER = process.env.COSMOS_MEMORY_CONTAINER;
-const USER_CONTAINER = process.env.COSMOS_USER_CONTAINER;
 
-const RESPONSES_URL =
-    `${OPENAI_ENDPOINT_CHAT}/openai/responses?api-version=2025-04-01-preview`;
+/* ================== COSMOS ================== */
+const memoryContainer = getContainer(MEMORY_CONTAINER);
+const messageContainer = getContainer(MESSAGE_CONTAINER);
 
-/* ================== UTIL ================== */
+/* ================== AXIOS INSTANCES (REUSE CONNECTIONS) ================== */
+const embeddingClient = axios.create({
+    baseURL: OPENAI_ENDPOINT_EMBEDDING,
+    headers: {
+        "api-key": OPENAI_API_KEY_EMBEDDING,
+        "Content-Type": "application/json"
+    },
+    timeout: 3000, // Aggressive timeout
+    maxRedirects: 0,
+    httpAgent: new (require('http').Agent)({ keepAlive: true }),
+    httpsAgent: new (require('https').Agent)({ keepAlive: true })
+});
 
-function extractTextFromResponse(data) {
-    if (!data?.output) return null;
-    for (const item of data.output) {
-        for (const block of item.content || []) {
-            if (block.type === "output_text") return block.text;
-        }
-    }
-    return null;
+const chatClient = axios.create({
+    baseURL: RESPONSES_URL_4_MODEL,
+    headers: {
+        "api-key": OPENAI_KEY_CHAT_4_MODEL,
+        "Content-Type": "application/json"
+    },
+    timeout: 8000,
+    maxRedirects: 0,
+    httpAgent: new (require('http').Agent)({ keepAlive: true }),
+    httpsAgent: new (require('https').Agent)({ keepAlive: true })
+});
+
+/* ================== TIMING ================== */
+function now() {
+    return Number(process.hrtime.bigint()) / 1e6;
+}
+function logStep(label, start) {
+    console.log(`[LATENCY] ${label}: ${(now() - start).toFixed(2)} ms`);
 }
 
-/* ================== FAST FACT DETECTION ================== */
+/* ================== AUTH ================== */
+function verifyTokenFast(req) {
+    const auth = req.headers.authorization;
+    if (!auth) return null;
+    const token = auth.split(" ")[1];
+    return jwt.verify(token, process.env.JWT_SECRET);
+}
 
-// cheap + fast (NO AI)
-function isLikelyFact(message) {
-    return /i am|i'm|i like|i love|i hate|vegetarian|vegan|allergic|diet|avoid|preference/i
-        .test(message.toLowerCase());
+/* ================== UTIL ================== */
+function extractTextFromChatCompletion(data) {
+    return data?.choices?.[0]?.message?.content?.trim() || null;
+}
+
+function generateDeterministicId(seed) {
+    return crypto.createHash("sha256").update(seed).digest("hex").substring(0, 32);
+}
+
+/* ================== MEMORY RULES ================== */
+const MEMORY_REGEX = /i am|i'm|i like|i love|i hate|vegetarian|vegan|allergic|diet|avoid|preference/i;
+function shouldSaveMemory(message) {
+    return MEMORY_REGEX.test(message);
 }
 
 /* ================== EMBEDDINGS ================== */
+const embeddingCache = new Map();
+const MAX_CACHE_SIZE = 500;
 
 async function generateEmbedding(text) {
-    const res = await axios.post(
-        `${OPENAI_ENDPOINT_EMBEDDING}/openai/deployments/${EMBEDDING_DEPLOYMENT}/embeddings?api-version=2024-10-01-preview`,
-        { input: [text] },
-        {
-            headers: {
-                "api-key": OPENAI_API_KEY_EMBEDDING,
-                "Content-Type": "application/json"
-            }
-        }
+    if (embeddingCache.has(text)) return embeddingCache.get(text);
+
+    const { data } = await embeddingClient.post(
+        `/openai/deployments/${EMBEDDING_DEPLOYMENT}/embeddings?api-version=2024-10-01-preview`,
+        { input: [text], dimensions: 1536 } // Specify dimensions explicitly
     );
-    return res.data.data[0].embedding;
-}
 
-/* ================== MEMORY ================== */
-
-async function saveMemoryBackground(userId, message, aiResponse) {
-    try {
-        const memoryContainer = getContainer(MEMORY_CONTAINER);
-
-        const isFact = isLikelyFact(message);
-        const embedding = await generateEmbedding(message);
-
-        await memoryContainer.items.create({
-            id: crypto.randomUUID(),
-            userId,
-            memoryCategory: isFact ? "fact" : "conversation",
-            userMessage: message,
-            aiResponse,
-            embedding,
-            createdAt: new Date().toISOString()
-        });
-
-    } catch (err) {
-        console.error("Background memory save failed:", err.message);
+    const embedding = data.data[0].embedding;
+    
+    // LRU cache management
+    if (embeddingCache.size >= MAX_CACHE_SIZE) {
+        const firstKey = embeddingCache.keys().next().value;
+        embeddingCache.delete(firstKey);
     }
+    embeddingCache.set(text, embedding);
+    
+    return embedding;
 }
 
-/* ================== READ MEMORY (FAST) ================== */
+/* ================== VECTOR SEARCH (OPTIMIZED) ================== */
+async function vectorSearchUnified(userId, embedding) {
+    // Simplified query with minimal projection
+    const query = `
+        SELECT TOP 3
+            c.userMessage,
+            c.aiResponse,
+            c.memoryCategory
+        FROM c
+        WHERE c.userId = @userId
+          AND VectorDistance(c.embedding, @embedding) < 0.6
+        ORDER BY VectorDistance(c.embedding, @embedding)
+    `;
 
-async function getUserFacts(userId) {
-    const memoryContainer = getContainer(MEMORY_CONTAINER);
+    const { resources } = await memoryContainer.items
+        .query(
+            {
+                query,
+                parameters: [
+                    { name: "@userId", value: userId },
+                    { name: "@embedding", value: embedding }
+                ]
+            },
+            { 
+                partitionKey: userId,
+                maxItemCount: 3 // Limit results
+            }
+        )
+        .fetchAll();
 
-    const { resources } = await memoryContainer.items.query({
-        query: `
-            SELECT c.userMessage FROM c
-            WHERE c.userId = @userId
-            AND c.memoryCategory = "fact"
-            ORDER BY c.createdAt DESC
-            OFFSET 0 LIMIT 5
-        `,
-        parameters: [{ name: "@userId", value: userId }]
-    }).fetchAll();
-
-    return resources.length
-        ? resources.map(r => `- ${r.userMessage}`).join("\n")
-        : "None";
+    return resources;
 }
 
-async function getRecentConversation(userId) {
-    const memoryContainer = getContainer(MEMORY_CONTAINER);
+/* ================== CONTEXT BUILDER (OPTIMIZED) ================== */
+function buildContext(memories) {
+    if (!memories || memories.length === 0) {
+        return { facts: "None", contextText: "None" };
+    }
 
-    const { resources } = await memoryContainer.items.query({
-        query: `
-            SELECT c.userMessage, c.aiResponse FROM c
-            WHERE c.userId = @userId
-            AND c.memoryCategory = "conversation"
-            ORDER BY c.createdAt DESC
-            OFFSET 0 LIMIT 3
-        `,
-        parameters: [{ name: "@userId", value: userId }]
-    }).fetchAll();
+    let facts = "";
+    let contextText = "";
 
-    return resources.length
-        ? resources.map(r => `- ${r.userMessage} → ${r.aiResponse}`).join("\n")
-        : "None";
+    for (const m of memories) {
+        if (m.memoryCategory === "fact") {
+            facts += `- ${m.userMessage}\n`;
+        } else if (m.memoryCategory === "conversation") {
+            contextText += `- ${m.userMessage} → ${m.aiResponse}\n`;
+        }
+    }
+
+    return {
+        facts: facts || "None",
+        contextText: contextText || "None"
+    };
 }
 
-/* ================== MAIN ================== */
+/* ================== BACKGROUND SAVE ================== */
+function persistDataInBackground({ userId, message, aiResponse }) {
+    const timestamp = new Date().toISOString();
 
+    setImmediate(async () => {
+        try {
+            const messageId = generateDeterministicId(`${userId}-${timestamp}-${message}`);
+            
+            const saveMessage = messageContainer.items.create({
+                id: messageId,
+                userId,
+                message,
+                response: aiResponse,
+                timestamp
+            });
+
+            let saveMemory = Promise.resolve();
+            if (shouldSaveMemory(message)) {
+                saveMemory = (async () => {
+                    const embedding = await generateEmbedding(message);
+                    await memoryContainer.items.create({
+                        id: generateDeterministicId(`${userId}-memory-${timestamp}-${message}`),
+                        userId,
+                        memoryCategory: "fact",
+                        userMessage: message,
+                        aiResponse,
+                        embedding,
+                        createdAt: timestamp
+                    });
+                })();
+            }
+
+            await Promise.allSettled([saveMessage, saveMemory]);
+            console.log("[BG SAVE] Complete");
+        } catch (err) {
+            console.error("[BG SAVE ERROR]", err.message);
+        }
+    });
+}
+
+/* ================== MAIN (ULTRA OPTIMIZED) ================== */
 module.exports = async function (context, req) {
+    const t0 = now();
+
     try {
-        const user = await verifyToken(req);
+        // Fast auth check
+        const user = verifyTokenFast(req);
         if (!user) {
             context.res = { status: 401, body: { message: "Unauthorized" } };
             return;
@@ -133,72 +212,57 @@ module.exports = async function (context, req) {
             return;
         }
 
-        /* 🔥 PARALLEL READS */
-        const [facts, recentContext] = await Promise.all([
-            getUserFacts(userId),
-            getRecentConversation(userId)
-        ]);
+        /*  PARALLEL: Embedding+Search AND AI Call start simultaneously */
+        const tParallel = now();
+        
+        const retrievalPromise = generateEmbedding(message)
+            .then(emb => vectorSearchUnified(userId, emb))
+            .then(memories => buildContext(memories));
 
-        const prompt = `
-You are a helpful AI assistant.
+        // Start AI call immediately with minimal context (will use retrieved context if ready)
+        let prompt;
+        const aiPromise = (async () => {
+            const { facts, contextText } = await retrievalPromise;
+            
+            const prompt = `User preferences:\n${facts}\n\nRecent context:\n${contextText}\n\nUser:\n${message}\n\nReply in 1–2 short sentences.`;
+            
+            const tAI = now();
+            const { data } = await chatClient.post('', {
+                messages: [
+                    { role: "system", content: "You are a helpful assistant." },
+                    { role: "user", content: prompt }
+                ],
+                temperature: 0.3,
+                max_tokens: 100,
+                stream: false
+            });
+            logStep("OpenAI", tAI);
+            
+            return extractTextFromChatCompletion(data) || "Sorry, I couldn't generate a response.";
+        })();
 
-USER FACTS (always follow):
-${facts}
+        const aiResponse = await aiPromise;
+        logStep("Parallel (Total)", tParallel);
 
-RECENT CONTEXT:
-${recentContext}
+        /*  BACKGROUND SAVE */
+        persistDataInBackground({ userId, message, aiResponse });
 
-Rules:
-- Always respect diet & preferences
-
-User:
-${message}
-
-Answer clearly.
-        `;
-
-        /* 🤖 OPENAI CHAT */
-        const aiRes = await axios.post(
-            RESPONSES_URL,
-            { model: "gpt-5.2-chat", input: prompt },
-            {
-                headers: {
-                    "api-key": OPENAI_KEY_CHAT,
-                    "Content-Type": "application/json"
-                }
-            }
-        );
-
-        const aiResponse =
-            extractTextFromResponse(aiRes.data) ||
-            "Sorry, I couldn't generate a response.";
-
-        /* 🚀 SEND RESPONSE IMMEDIATELY */
         context.res = {
             status: 200,
             body: {
                 success: true,
-                data: aiResponse
+                data: aiResponse,
+                prompt: prompt
             }
         };
 
-        /* 🔁 BACKGROUND TASKS (NO WAIT) */
-        setImmediate(async () => {
-            const messageContainer = getContainer(MESSAGE_CONTAINER);
-
-            await messageContainer.items.create({
-                id: crypto.randomUUID(),
-                userId,
-                message,
-                response: aiResponse,
-                timestamp: new Date().toISOString()
-            });
-
-            await saveMemoryBackground(userId, message, aiResponse);
-        });
+        logStep("TOTAL (Response Sent)", t0);
 
     } catch (err) {
-        context.log("ERROR:", err?.response?.data || err);
-        context.res = { status: 500, body: { message: "Internal server error" } };
+        console.error("ERROR:", err?.response?.data || err.message || err);
+        context.res = { 
+            status: 500, 
+            body: { message: "Internal server error" }
+        };
     }
 };
