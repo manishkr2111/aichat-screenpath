@@ -53,11 +53,18 @@ function logStep(label, start) {
 
 /* ================== AUTH ================== */
 function verifyTokenFast(req) {
-    const auth = req.headers.authorization;
-    if (!auth) return null;
-    const token = auth.split(" ")[1];
-    return jwt.verify(token, process.env.JWT_SECRET);
+    try {
+        const auth = req.headers.authorization;
+        if (!auth) return null;
+
+        const token = auth.split(" ")[1];
+        return jwt.verify(token, process.env.JWT_SECRET);
+    } catch (err) {
+        console.error("JWT ERROR:", err.message);
+        return null;
+    }
 }
+
 
 /* ================== UTIL ================== */
 function extractTextFromChatCompletion(data) {
