@@ -68,15 +68,24 @@ module.exports = async function (context, req) {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
-        // Create new user
-        // Get max id
+        // Get max id - improved query
         const queryMaxId = {
-            query: "SELECT VALUE MAX(c.id) FROM c"
+            query: "SELECT c.id FROM c ORDER BY c.id DESC OFFSET 0 LIMIT 1"
         };
-        const { resources: maxIdResult } = await usersContainer.items.query(queryMaxId).fetchAll();
+        
         let newId = 1;
-        if (maxIdResult[0]) {
-            newId = parseInt(maxIdResult[0]) + 1;
+        try {
+            const { resources: maxIdResult } = await usersContainer.items.query(queryMaxId).fetchAll();
+            
+            if (maxIdResult.length > 0 && maxIdResult[0].id) {
+                const currentMaxId = parseInt(maxIdResult[0].id);
+                if (!isNaN(currentMaxId)) {
+                    newId = currentMaxId + 1;
+                }
+            }
+        } catch (idError) {
+            context.log('Error getting max ID, using default:', idError);
+            // If query fails, just use newId = 1
         }
 
         // Create new user
@@ -87,7 +96,6 @@ module.exports = async function (context, req) {
             password: hashedPassword,
             createdAt: new Date().toISOString()
         };
-
 
         // Save to database
         const { resource: createdUser } = await usersContainer.items.create(newUser);
