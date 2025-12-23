@@ -7,10 +7,8 @@ const crypto = require("crypto");
 const OPENAI_ENDPOINT_EMBEDDING = process.env.OPENAI_ENDPOINT_EMBEDDING;
 const OPENAI_API_KEY_EMBEDDING = process.env.OPENAI_API_KEY_EMBEDDING;
 const EMBEDDING_DEPLOYMENT = process.env.EMBEDDING_DEPLOYMENT;
-
 const RESPONSES_URL_4_MODEL = process.env.OPENAI_ENDPOINT_CHAT_4_MODEL;
 const OPENAI_KEY_CHAT_4_MODEL = process.env.OPENAI_KEY_CHAT_4_MODEL;
-
 const MESSAGE_CONTAINER = process.env.COSMOS_MESSAGE_CONTAINER;
 const MEMORY_CONTAINER = process.env.COSMOS_MEMORY_CONTAINER;
 
@@ -18,27 +16,24 @@ const MEMORY_CONTAINER = process.env.COSMOS_MEMORY_CONTAINER;
 const memoryContainer = getContainer(MEMORY_CONTAINER);
 const messageContainer = getContainer(MESSAGE_CONTAINER);
 
-/* ================== AXIOS INSTANCES (REUSE CONNECTIONS) ================== */
+/* ================== AXIOS INSTANCES ================== */
 const embeddingClient = axios.create({
     baseURL: OPENAI_ENDPOINT_EMBEDDING,
     headers: {
         "api-key": OPENAI_API_KEY_EMBEDDING,
         "Content-Type": "application/json"
     },
-    timeout: 3000, // Aggressive timeout
-    maxRedirects: 0,
+    timeout: 5000,
     httpAgent: new (require('http').Agent)({ keepAlive: true }),
     httpsAgent: new (require('https').Agent)({ keepAlive: true })
 });
 
 const chatClient = axios.create({
-    baseURL: RESPONSES_URL_4_MODEL,
     headers: {
         "api-key": OPENAI_KEY_CHAT_4_MODEL,
         "Content-Type": "application/json"
     },
-    timeout: 8000,
-    maxRedirects: 0,
+    timeout: 10000,
     httpAgent: new (require('http').Agent)({ keepAlive: true }),
     httpsAgent: new (require('https').Agent)({ keepAlive: true })
 });
@@ -47,24 +42,19 @@ const chatClient = axios.create({
 function now() {
     return Number(process.hrtime.bigint()) / 1e6;
 }
-function logStep(label, start) {
-    console.log(`[LATENCY] ${label}: ${(now() - start).toFixed(2)} ms`);
-}
 
 /* ================== AUTH ================== */
 function verifyTokenFast(req) {
     try {
         const auth = req.headers.authorization;
         if (!auth) return null;
-
         const token = auth.split(" ")[1];
         return jwt.verify(token, process.env.JWT_SECRET);
     } catch (err) {
-        console.error("JWT ERROR:", err.message);
+        console.error("[AUTH ERROR]:", err.message);
         return null;
     }
 }
-
 
 /* ================== UTIL ================== */
 function extractTextFromChatCompletion(data) {
@@ -77,8 +67,17 @@ function generateDeterministicId(seed) {
 
 /* ================== MEMORY RULES ================== */
 const MEMORY_REGEX = /i am|i'm|i like|i love|i hate|vegetarian|vegan|allergic|diet|avoid|preference/i;
+const FACT_REGEX = /i am|i'm|i like|i love|i hate|vegetarian|vegan|allergic|diet|avoid|preference/i;
+
 function shouldSaveMemory(message) {
-    return MEMORY_REGEX.test(message);
+    const text = message.toLowerCase().trim();
+    // Skip greetings
+    if (/^(hi|hello|hey|ok|thanks|thank you|yes|no)$/i.test(text)) return false;
+    return MEMORY_REGEX.test(text);
+}
+
+function isLikelyFact(message) {
+    return FACT_REGEX.test(message.toLowerCase());
 }
 
 /* ================== EMBEDDINGS ================== */
@@ -86,16 +85,19 @@ const embeddingCache = new Map();
 const MAX_CACHE_SIZE = 500;
 
 async function generateEmbedding(text) {
-    if (embeddingCache.has(text)) return embeddingCache.get(text);
+    if (embeddingCache.has(text)) {
+        return embeddingCache.get(text);
+    }
 
+    const tStart = now();
     const { data } = await embeddingClient.post(
         `/openai/deployments/${EMBEDDING_DEPLOYMENT}/embeddings?api-version=2024-10-01-preview`,
-        { input: [text], dimensions: 1536 } // Specify dimensions explicitly
+        { input: [text] }
     );
 
     const embedding = data.data[0].embedding;
     
-    // LRU cache management
+    // LRU cache
     if (embeddingCache.size >= MAX_CACHE_SIZE) {
         const firstKey = embeddingCache.keys().next().value;
         embeddingCache.delete(firstKey);
@@ -105,17 +107,18 @@ async function generateEmbedding(text) {
     return embedding;
 }
 
-/* ================== VECTOR SEARCH (OPTIMIZED) ================== */
+/* ================== VECTOR SEARCH ================== */
 async function vectorSearchUnified(userId, embedding) {
-    // Simplified query with minimal projection
+    
+    //  Get TOP 5 results without distance filter in query for better debugging
     const query = `
-        SELECT TOP 3
+        SELECT TOP 5
             c.userMessage,
             c.aiResponse,
-            c.memoryCategory
+            c.memoryCategory,
+            VectorDistance(c.embedding, @embedding) AS score
         FROM c
         WHERE c.userId = @userId
-          AND VectorDistance(c.embedding, @embedding) < 0.6
         ORDER BY VectorDistance(c.embedding, @embedding)
     `;
 
@@ -130,15 +133,27 @@ async function vectorSearchUnified(userId, embedding) {
             },
             { 
                 partitionKey: userId,
-                maxItemCount: 3 // Limit results
+                maxItemCount: 5
             }
         )
         .fetchAll();
 
-    return resources;
+    const threshold = 0.8;
+    const filtered = resources.filter(r => r.score < threshold);
+    
+    if (resources.length > 0) {
+        // Log what was found for debugging
+        resources.forEach((r, i) => {
+            const kept = r.score < threshold ? "✓" : "✗";
+        });
+    } else {
+        // console.log(`[VECTOR SEARCH] ${(now() - tStart).toFixed(2)}ms - ⚠️ Found: 0 memories for userId: ${userId}`);
+    }
+    
+    return filtered;
 }
 
-/* ================== CONTEXT BUILDER (OPTIMIZED) ================== */
+/* ================== CONTEXT BUILDER ================== */
 function buildContext(memories) {
     if (!memories || memories.length === 0) {
         return { facts: "None", contextText: "None" };
@@ -161,51 +176,14 @@ function buildContext(memories) {
     };
 }
 
-/* ================== BACKGROUND SAVE ================== */
-function persistDataInBackground({ userId, message, aiResponse }) {
-    const timestamp = new Date().toISOString();
-
-    setImmediate(async () => {
-        try {
-            const messageId = generateDeterministicId(`${userId}-${timestamp}-${message}`);
-            
-            const saveMessage = messageContainer.items.create({
-                id: messageId,
-                userId,
-                message,
-                response: aiResponse,
-                timestamp
-            });
-
-            let saveMemory = Promise.resolve();
-            if (shouldSaveMemory(message)) {
-                saveMemory = (async () => {
-                    const embedding = await generateEmbedding(message);
-                    await memoryContainer.items.create({
-                        id: generateDeterministicId(`${userId}-memory-${timestamp}-${message}`),
-                        userId,
-                        memoryCategory: "fact",
-                        userMessage: message,
-                        aiResponse,
-                        embedding,
-                        createdAt: timestamp
-                    });
-                })();
-            }
-
-            await Promise.allSettled([saveMessage, saveMemory]);
-        } catch (err) {
-            console.error("[BG SAVE ERROR]", err.message);
-        }
-    });
-}
-
-/* ================== MAIN (ULTRA OPTIMIZED) ================== */
+/* ================== MAIN ================== */
 module.exports = async function (context, req) {
 
     try {
-        // Fast auth check
+        // Auth
+        const tAuth = now();
         const user = verifyTokenFast(req);
+        
         if (!user) {
             context.res = { status: 401, body: { message: "Unauthorized" } };
             return;
@@ -217,47 +195,93 @@ module.exports = async function (context, req) {
             return;
         }
 
-        /*  PARALLEL: Embedding+Search AND AI Call start simultaneously */
-        
-        const retrievalPromise = generateEmbedding(message)
-            .then(emb => vectorSearchUnified(userId, emb))
-            .then(memories => buildContext(memories));
 
-        // Start AI call immediately with minimal context (will use retrieved context if ready)
-        const aiPromise = (async () => {
-            const { facts, contextText } = await retrievalPromise;
+        /* ===== RETRIEVAL (if needed) ===== */
+        let facts = "None";
+        let contextText = "None";
+        let embedding = null;
+
+        if (shouldSaveMemory(message)) {
+            const tRetrieval = now();
             
-            const prompt = `User preferences:\n${facts}\n\nRecent context:\n${contextText}\n\nUser:\n${message}\n\nReply in 1–2 short sentences.`;
+            embedding = await generateEmbedding(message);
+            const memories = await vectorSearchUnified(userId, embedding);
             
-            const { data } = await chatClient.post('', {
-                messages: [
-                    { role: "system", content: "You are a helpful assistant." },
-                    { role: "user", content: prompt }
-                ],
-                temperature: 0.3,
-                max_tokens: 100,
-                stream: false
+            if (memories.length > 0) {
+                const ctx = buildContext(memories);
+                facts = ctx.facts;
+                contextText = ctx.contextText;
+            }
+            
+        } else {
+            // console.log("[RETRIEVAL] Skipped - message doesn't need memory");
+        }
+
+        /* ===== AI GENERATION ===== */
+        const prompt = `User preferences:\n${facts}\n\nRecent context:\n${contextText}\n\nUser:\n${message}\n\nReply in 1–2 short sentences.`;
+
+        const { data } = await chatClient.post(RESPONSES_URL_4_MODEL, {
+            messages: [
+                { role: "system", content: "You are a helpful assistant." },
+                { role: "user", content: prompt }
+            ],
+            temperature: 0.3,
+            max_tokens: 100
+        });
+        
+        const aiResponse = extractTextFromChatCompletion(data) || "Sorry, I couldn't generate a response.";
+
+        /* ===== PERSIST DATA (GUARANTEED) ===== */
+        const timestamp = new Date().toISOString();
+        const messageId = generateDeterministicId(`${userId}-${timestamp}-${message}`);
+
+        //  Save message (fire-and-forget)
+        const messageSave = messageContainer.items.create({
+            id: messageId,
+            userId,
+            message,
+            response: aiResponse,
+            timestamp
+        }).then(() => {
+            // console.log(`[SAVE] Message: ${messageId}`);
+        }).catch(e => {
+            // console.error(`[SAVE ERROR - Message]:`, e.message);
+        });
+
+        //  Save memory SYNCHRONOUSLY (critical path)
+        if (shouldSaveMemory(message)) {
+            const memoryId = generateDeterministicId(`${userId}-memory-${timestamp}-${message}`);
+            const memoryEmbedding = embedding || await generateEmbedding(message);
+            const category = isLikelyFact(message) ? "fact" : "conversation";
+                        
+            await memoryContainer.items.create({
+                id: memoryId,
+                userId,
+                memoryCategory: category,
+                userMessage: message,
+                aiResponse,
+                embedding: memoryEmbedding,
+                createdAt: timestamp
             });
             
-            return extractTextFromChatCompletion(data) || "Sorry, I couldn't generate a response.";
-        })();
+        }
+        
+        // Wait for message save (optional - can remove for 100ms faster response)
+        await messageSave;
 
-        const aiResponse = await aiPromise;
-
-        /*  BACKGROUND SAVE */
-        persistDataInBackground({ userId, message, aiResponse });
+        /* ===== RESPOND ===== */
 
         context.res = {
             status: 200,
             body: {
                 success: true,
-                data: aiResponse,
+                data: aiResponse
             }
         };
 
-
     } catch (err) {
-        console.error("ERROR:", err?.response?.data || err.message || err);
+        console.error("[ERROR]:", err?.response?.data || err.message || err);
+        console.error("[STACK]:", err.stack);
         context.res = { 
             status: 500, 
             body: { message: "Internal server error" }
