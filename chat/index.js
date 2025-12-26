@@ -1,5 +1,6 @@
 const { getContainer } = require("../db");
-const SIYAN_SYSTEM_PROMPT = require('../prompts/system-siyan-reflect'); 
+const { getNextConversationId } = require("../src/services/conversation.service");
+const SIYAN_SYSTEM_PROMPT = require('../prompts/system-siyan-reflect');
 const axios = require("axios");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
@@ -79,14 +80,6 @@ function shouldSaveMemory(message) {
     return MEMORY_REGEX.test(text);
 }
 
-function shouldRetrieveMemory(message) {
-    const text = message.toLowerCase().trim();
-    // Skip very short greetings
-    if (/^(hi|hello|hey)$/i.test(text)) return false;
-    // Retrieve for questions about history or anything longer
-    return text.length > 10 || /previous|before|earlier|last time|remember|history|what did|what was/i.test(text);
-}
-
 function isLikelyFact(message) {
     return FACT_REGEX.test(message.toLowerCase());
 }
@@ -107,20 +100,20 @@ async function generateEmbedding(text) {
     );
 
     const embedding = data.data[0].embedding;
-    
+
     // LRU cache
     if (embeddingCache.size >= MAX_CACHE_SIZE) {
         const firstKey = embeddingCache.keys().next().value;
         embeddingCache.delete(firstKey);
     }
     embeddingCache.set(text, embedding);
-    
+
     return embedding;
 }
 
 /* ================== VECTOR SEARCH ================== */
 async function vectorSearchUnified(userId, embedding) {
-    
+
     //  Get TOP 5 results without distance filter in query for better debugging
     const query = `
         SELECT TOP 5
@@ -142,7 +135,7 @@ async function vectorSearchUnified(userId, embedding) {
                     { name: "@embedding", value: embedding }
                 ]
             },
-            { 
+            {
                 partitionKey: userId,
                 maxItemCount: 5
             }
@@ -151,7 +144,7 @@ async function vectorSearchUnified(userId, embedding) {
 
     const threshold = 0.8;
     const filtered = resources.filter(r => r.score < threshold);
-    
+
     if (resources.length > 0) {
         // Log what was found for debugging
         resources.forEach((r, i) => {
@@ -160,7 +153,7 @@ async function vectorSearchUnified(userId, embedding) {
     } else {
         // console.log(`[VECTOR SEARCH] ${(now() - tStart).toFixed(2)}ms - ⚠️ Found: 0 memories for userId: ${userId}`);
     }
-    
+
     return filtered;
 }
 
@@ -193,17 +186,26 @@ module.exports = async function (context, req) {
     try {
         // Auth
         const user = verifyTokenFast(req);
-        
+
         if (!user) {
             context.res = { status: 401, body: { message: "Unauthorized" } };
             return;
         }
 
-        const { userId, message } = req.body || {};
+        let { userId, message, conversationId, new_chat } = req.body || {};
         if (!userId || !message) {
-            context.res = { status: 400, body: { message: "userId and message required" } };
+            context.res = { status: 400, body: { success: false, message: "userId and message required" } };
             return;
         }
+        // if (new_chat == true) {
+        //     conversationId = await getNextConversationId(userId);
+        // } else if(new_chat == false) {
+        //     if (!conversationId || conversationId == "") {
+        //         context.res = { status: 400, body: { success: false, message: "conversationId id missing" } };
+        //         return;
+        //     }
+        //     conversationId = conversationId;
+        // }
 
 
         /* ===== RETRIEVAL (if needed) ===== */
@@ -211,21 +213,20 @@ module.exports = async function (context, req) {
         let contextText = "None";
         let embedding = null;
 
-        if (shouldRetrieveMemory(message)) {
+        if (shouldSaveMemory(message)) {
             const tRetrieval = now();
-            
+
             embedding = await generateEmbedding(message);
             const memories = await vectorSearchUnified(userId, embedding);
-            
+
             if (memories.length > 0) {
                 const ctx = buildContext(memories);
                 facts = ctx.facts;
                 contextText = ctx.contextText;
             }
-            
-            console.log(`[RETRIEVAL] ${(now() - tRetrieval).toFixed(2)}ms - Retrieved ${memories.length} memories`);
+
         } else {
-            console.log("[RETRIEVAL] Skipped - message doesn't need memory retrieval");
+            // console.log("[RETRIEVAL] Skipped - message doesn't need memory");
         }
 
         /* ===== AI GENERATION ===== */
@@ -237,9 +238,9 @@ module.exports = async function (context, req) {
                 { role: "user", content: prompt }
             ],
             temperature: TEMPERATURE || 0.3,
-            max_completion_tokens: MAX_TOKEN|| 100
+            max_completion_tokens: MAX_TOKEN || 100
         });
-        
+
         const aiResponse = extractTextFromChatCompletion(data) || "Sorry, I couldn't generate a response.";
 
         /* ===== PERSIST DATA (GUARANTEED) ===== */
@@ -250,36 +251,35 @@ module.exports = async function (context, req) {
         const messageSave = messageContainer.items.create({
             id: messageId,
             userId,
+            // conversationId,
             message,
             response: aiResponse,
             timestamp
         }).then(() => {
-            console.log(`[SAVE] Message: ${messageId}`);
+            // console.log(`[SAVE] Message: ${messageId}`);
         }).catch(e => {
-            console.error(`[SAVE ERROR - Message]:`, e.message);
+            // console.error(`[SAVE ERROR - Message]:`, e.message);
         });
 
-        //  Save memory SYNCHRONOUSLY (critical path) - only if it matches save criteria
+        //  Save memory SYNCHRONOUSLY (critical path)
         if (shouldSaveMemory(message)) {
             const memoryId = generateDeterministicId(`${userId}-memory-${timestamp}-${message}`);
             const memoryEmbedding = embedding || await generateEmbedding(message);
             const category = isLikelyFact(message) ? "fact" : "conversation";
-                        
+
             await memoryContainer.items.create({
                 id: memoryId,
                 userId,
+                // conversationId,
                 memoryCategory: category,
                 userMessage: message,
                 aiResponse,
                 embedding: memoryEmbedding,
                 createdAt: timestamp
             });
-            
-            console.log(`[SAVE] Memory: ${memoryId} (category: ${category})`);
-        } else {
-            console.log("[SAVE] Memory save skipped - doesn't match save criteria");
+
         }
-        
+
         // Wait for message save (optional - can remove for 100ms faster response)
         await messageSave;
 
@@ -296,8 +296,8 @@ module.exports = async function (context, req) {
     } catch (err) {
         console.error("[ERROR]:", err?.response?.data || err.message || err);
         console.error("[STACK]:", err.stack);
-        context.res = { 
-            status: 500, 
+        context.res = {
+            status: 500,
             body: { message: "Internal server error" }
         };
     }

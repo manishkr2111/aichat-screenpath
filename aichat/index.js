@@ -1,4 +1,5 @@
 const { getContainer } = require("../db");
+const { getNextConversationId } = require("../src/services/conversation.service");
 const SIYAN_SYSTEM_PROMPT = require('../prompts/system-siyan-reflect');
 const axios = require("axios");
 const jwt = require("jsonwebtoken");
@@ -213,10 +214,19 @@ module.exports = async function (context, req) {
             return;
         }
 
-        const { userId, message } = req.body || {};
+        let { userId, message, conversationId, new_chat } = req.body || {};
         if (!userId || !message) {
-            context.res = { status: 400, body: { message: "userId and message required" } };
+            context.res = { status: 400, body: { success: false, message: "userId and message required" } };
             return;
+        }
+        if (new_chat == true) {
+            conversationId = await getNextConversationId(userId);
+        } else if (new_chat == false) {
+            if (!conversationId || conversationId == "") {
+                context.res = { status: 400, body: { success: false, message: "conversationId id missing" } };
+                return;
+            }
+            conversationId = conversationId;
         }
 
         console.log(`[USER] ${userId} | [MSG] "${message}"`);
@@ -269,6 +279,7 @@ module.exports = async function (context, req) {
         const messageSave = messageContainer.items.create({
             id: messageId,
             userId,
+            conversationId,
             message,
             response: aiResponse,
             timestamp
@@ -289,6 +300,7 @@ module.exports = async function (context, req) {
             await memoryContainer.items.create({
                 id: memoryId,
                 userId,
+                conversationId,
                 memoryCategory: category,
                 userMessage: message,
                 aiResponse,

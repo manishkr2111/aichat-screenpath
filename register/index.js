@@ -69,24 +69,30 @@ module.exports = async function (context, req) {
         const hashedPassword = await bcrypt.hash(password, salt);
 
         // Get max id - improved query
-        const queryMaxId = {
-            query: "SELECT c.id FROM c ORDER BY c.id DESC OFFSET 0 LIMIT 1"
+        // Get max id - fetch ALL users and find max numerically
+        const queryAllIds = {
+            query: "SELECT c.id FROM c"
         };
-        
+
         let newId = 1;
         try {
-            const { resources: maxIdResult } = await usersContainer.items.query(queryMaxId).fetchAll();
-            
-            if (maxIdResult.length > 0 && maxIdResult[0].id) {
-                const currentMaxId = parseInt(maxIdResult[0].id);
-                if (!isNaN(currentMaxId)) {
-                    newId = currentMaxId + 1;
+            const { resources: allUsers } = await usersContainer.items.query(queryAllIds).fetchAll();
+
+            if (allUsers.length > 0) {
+                // Convert all IDs to numbers and find the maximum
+                const numericIds = allUsers
+                    .map(user => parseInt(user.id))
+                    .filter(id => !isNaN(id));
+
+                if (numericIds.length > 0) {
+                    const maxId = Math.max(...numericIds);
+                    newId = maxId + 1;
                 }
             }
         } catch (idError) {
             context.log('Error getting max ID, using default:', idError);
-            // If query fails, just use newId = 1
         }
+
 
         // Create new user
         const newUser = {
