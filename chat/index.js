@@ -1,4 +1,5 @@
 const { getContainer } = require("../db");
+const SIYAN_SYSTEM_PROMPT = require('../prompts/system-siyan-reflect'); 
 const axios = require("axios");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
@@ -11,6 +12,8 @@ const RESPONSES_URL_4_MODEL = process.env.OPENAI_ENDPOINT_CHAT_4_MODEL;
 const OPENAI_KEY_CHAT_4_MODEL = process.env.OPENAI_KEY_CHAT_4_MODEL;
 const MESSAGE_CONTAINER = process.env.COSMOS_MESSAGE_CONTAINER;
 const MEMORY_CONTAINER = process.env.COSMOS_MEMORY_CONTAINER;
+const MAX_TOKEN = process.env.MAX_TOKEN;
+const TEMPERATURE = process.env.TEMPERATURE;
 
 /* ================== COSMOS ================== */
 const memoryContainer = getContainer(MEMORY_CONTAINER);
@@ -74,6 +77,14 @@ function shouldSaveMemory(message) {
     // Skip greetings
     if (/^(hi|hello|hey|ok|thanks|thank you|yes|no)$/i.test(text)) return false;
     return MEMORY_REGEX.test(text);
+}
+
+function shouldRetrieveMemory(message) {
+    const text = message.toLowerCase().trim();
+    // Skip very short greetings
+    if (/^(hi|hello|hey)$/i.test(text)) return false;
+    // Retrieve for questions about history or anything longer
+    return text.length > 10 || /previous|before|earlier|last time|remember|history|what did|what was/i.test(text);
 }
 
 function isLikelyFact(message) {
@@ -181,7 +192,6 @@ module.exports = async function (context, req) {
 
     try {
         // Auth
-        const tAuth = now();
         const user = verifyTokenFast(req);
         
         if (!user) {
@@ -201,7 +211,7 @@ module.exports = async function (context, req) {
         let contextText = "None";
         let embedding = null;
 
-        if (shouldSaveMemory(message)) {
+        if (shouldRetrieveMemory(message)) {
             const tRetrieval = now();
             
             embedding = await generateEmbedding(message);
@@ -213,20 +223,21 @@ module.exports = async function (context, req) {
                 contextText = ctx.contextText;
             }
             
+            console.log(`[RETRIEVAL] ${(now() - tRetrieval).toFixed(2)}ms - Retrieved ${memories.length} memories`);
         } else {
-            // console.log("[RETRIEVAL] Skipped - message doesn't need memory");
+            console.log("[RETRIEVAL] Skipped - message doesn't need memory retrieval");
         }
 
         /* ===== AI GENERATION ===== */
-        const prompt = `User preferences:\n${facts}\n\nRecent context:\n${contextText}\n\nUser:\n${message}\n\nReply in 1–2 short sentences.`;
+        const prompt = `User preferences:\n${facts}\n\nRecent context:\n${contextText}\n\nUser:\n${message}.`;
 
         const { data } = await chatClient.post(RESPONSES_URL_4_MODEL, {
             messages: [
-                { role: "system", content: "You are a helpful assistant." },
+                { role: "system", content: SIYAN_SYSTEM_PROMPT },
                 { role: "user", content: prompt }
             ],
-            temperature: 0.3,
-            max_tokens: 100
+            temperature: TEMPERATURE || 0.3,
+            max_completion_tokens: MAX_TOKEN|| 100
         });
         
         const aiResponse = extractTextFromChatCompletion(data) || "Sorry, I couldn't generate a response.";
@@ -243,12 +254,12 @@ module.exports = async function (context, req) {
             response: aiResponse,
             timestamp
         }).then(() => {
-            // console.log(`[SAVE] Message: ${messageId}`);
+            console.log(`[SAVE] Message: ${messageId}`);
         }).catch(e => {
-            // console.error(`[SAVE ERROR - Message]:`, e.message);
+            console.error(`[SAVE ERROR - Message]:`, e.message);
         });
 
-        //  Save memory SYNCHRONOUSLY (critical path)
+        //  Save memory SYNCHRONOUSLY (critical path) - only if it matches save criteria
         if (shouldSaveMemory(message)) {
             const memoryId = generateDeterministicId(`${userId}-memory-${timestamp}-${message}`);
             const memoryEmbedding = embedding || await generateEmbedding(message);
@@ -264,6 +275,9 @@ module.exports = async function (context, req) {
                 createdAt: timestamp
             });
             
+            console.log(`[SAVE] Memory: ${memoryId} (category: ${category})`);
+        } else {
+            console.log("[SAVE] Memory save skipped - doesn't match save criteria");
         }
         
         // Wait for message save (optional - can remove for 100ms faster response)
