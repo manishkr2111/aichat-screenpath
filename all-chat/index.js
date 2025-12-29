@@ -4,7 +4,15 @@ const MESSAGE_CONTAINER = process.env.COSMOS_MESSAGE_CONTAINER;
 
 module.exports = async function (context, req) {
     try {
-        const userId = String(req.query.userId || req.body.userId);
+        const rawUserId = req.query.userId ?? req.body?.userId;
+        if (rawUserId === undefined || rawUserId === null || rawUserId === "") {
+            context.res = {
+                status: 400,
+                body: { message: "userId is required" }
+            };
+            return;
+        }
+        const userId = String(rawUserId);
         if (!userId) {
             context.res = { status: 400, body: { message: "userId is required" } };
             return;
@@ -25,7 +33,11 @@ module.exports = async function (context, req) {
             ]
         };
 
-        const { resources } = await container.items.query(querySpec, { partitionKey: userId }).fetchAll();
+        const { resources } = await container.items
+            .query(querySpec)
+            .fetchAll();
+
+        resources.sort((a, b) => a.timestamp - b.timestamp);
 
         // Pick first message per conversation
         const conversationsMap = new Map();

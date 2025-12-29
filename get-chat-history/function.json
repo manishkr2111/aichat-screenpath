@@ -1,15 +1,12 @@
 {
     "bindings": [
         {
-            "type": "httpTrigger",
             "authLevel": "anonymous",
+            "type": "httpTrigger",
             "direction": "in",
             "name": "req",
-            "methods": [
-                "get",
-                "post"
-            ],
-            "route": "get-conversations"
+            "methods": ["get", "post"],
+            "route": "get-single-conversation"
         },
         {
             "type": "http",

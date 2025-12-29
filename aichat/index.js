@@ -205,7 +205,6 @@ module.exports = async function (context, req) {
         // Auth
         const tAuth = now();
         const user = verifyTokenFast(req);
-        console.log('userId', user.id);
 
         console.log(`[AUTH] ${(now() - tAuth).toFixed(2)}ms`);
 

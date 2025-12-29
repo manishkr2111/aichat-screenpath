@@ -197,15 +197,15 @@ module.exports = async function (context, req) {
             context.res = { status: 400, body: { success: false, message: "userId and message required" } };
             return;
         }
-        // if (new_chat == true) {
-        //     conversationId = await getNextConversationId(userId);
-        // } else if(new_chat == false) {
-        //     if (!conversationId || conversationId == "") {
-        //         context.res = { status: 400, body: { success: false, message: "conversationId id missing" } };
-        //         return;
-        //     }
-        //     conversationId = conversationId;
-        // }
+        if (new_chat == true) {
+            conversationId = await getNextConversationId(userId);
+        } else if(new_chat == false) {
+            if (!conversationId || conversationId == "") {
+                context.res = { status: 400, body: { success: false, message: "conversationId id missing" } };
+                return;
+            }
+            conversationId = conversationId;
+        }
 
 
         /* ===== RETRIEVAL (if needed) ===== */
@@ -251,7 +251,7 @@ module.exports = async function (context, req) {
         const messageSave = messageContainer.items.create({
             id: messageId,
             userId,
-            // conversationId,
+            conversationId,
             message,
             response: aiResponse,
             timestamp
@@ -270,7 +270,7 @@ module.exports = async function (context, req) {
             await memoryContainer.items.create({
                 id: memoryId,
                 userId,
-                // conversationId,
+                conversationId,
                 memoryCategory: category,
                 userMessage: message,
                 aiResponse,
