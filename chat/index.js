@@ -199,7 +199,7 @@ module.exports = async function (context, req) {
         }
         if (new_chat == true) {
             conversationId = await getNextConversationId(userId);
-        } else if(new_chat == false) {
+        } else{
             if (!conversationId || conversationId == "") {
                 context.res = { status: 400, body: { success: false, message: "conversationId id missing" } };
                 return;

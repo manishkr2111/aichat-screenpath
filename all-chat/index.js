@@ -44,6 +44,7 @@ module.exports = async function (context, req) {
         for (const item of resources) {
             if (!conversationsMap.has(item.conversationId)) {
                 conversationsMap.set(item.conversationId, {
+                    userId: userId,
                     conversationId: item.conversationId,
                     firstMessage: item.message,
                     timestamp: item.timestamp
