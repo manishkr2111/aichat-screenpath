@@ -24,7 +24,7 @@ async function getNextConversationId(userId) {
             userId,
             value: 1
         });
-        return 1;
+        return "1"; 
     }
 
     const next = resource.value + 1;
@@ -35,7 +35,7 @@ async function getNextConversationId(userId) {
         value: next
     });
 
-    return next;
+    return String(next); // ✅ string
 }
 module.exports = {
     getNextConversationId
