@@ -13,7 +13,7 @@ const database = client.database(databaseId);
 
 // Function to get any container dynamically
 const getContainer = (containerName) => {
-    console.log('Getting container:', containerName);
+    // console.log('Getting container:', containerName);
     return database.container(containerName);
 };
 

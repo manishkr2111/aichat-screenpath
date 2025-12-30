@@ -42,15 +42,18 @@ module.exports = async function (context, req) {
         // Pick first message per conversation
         const conversationsMap = new Map();
         for (const item of resources) {
-            if (!conversationsMap.has(item.conversationId)) {
-                conversationsMap.set(item.conversationId, {
+            const conversationId = String(item.conversationId); // ✅ normalize
+
+            if (!conversationsMap.has(conversationId)) {
+                conversationsMap.set(conversationId, {
                     userId: userId,
-                    conversationId: item.conversationId,
+                    conversationId: conversationId,
                     firstMessage: item.message,
                     timestamp: item.timestamp
                 });
             }
         }
+
 
         const conversations = Array.from(conversationsMap.values());
 

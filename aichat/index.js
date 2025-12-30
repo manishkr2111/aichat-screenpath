@@ -326,7 +326,11 @@ module.exports = async function (context, req) {
             status: 200,
             body: {
                 success: true,
-                data: aiResponse
+                message:"Response received successfully",
+                data: {
+                    conversationId: conversationId,
+                    aiResponse: aiResponse
+                }
             }
         };
 
