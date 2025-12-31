@@ -5,22 +5,20 @@ const MESSAGE_CONTAINER = process.env.COSMOS_MESSAGE_CONTAINER;
 module.exports = async function (context, req) {
     try {
         const rawUserId = req.query.userId ?? req.body?.userId;
-        if (rawUserId === undefined || rawUserId === null || rawUserId === "") {
+
+        if (!rawUserId) {
             context.res = {
                 status: 400,
                 body: { message: "userId is required" }
             };
             return;
         }
-        const userId = String(rawUserId);
-        if (!userId) {
-            context.res = { status: 400, body: { message: "userId is required" } };
-            return;
-        }
 
+        const userId = String(rawUserId);
         const container = getContainer(MESSAGE_CONTAINER);
 
-        // Query all messages of the user
+        /* ================= COSMOS QUERY ================= */
+
         const querySpec = {
             query: `
                 SELECT c.conversationId, c.message, c.timestamp
@@ -37,33 +35,42 @@ module.exports = async function (context, req) {
             .query(querySpec)
             .fetchAll();
 
-        resources.sort((a, b) => a.timestamp - b.timestamp);
+        /* ================= PROCESS DATA ================= */
 
-        // Pick first message per conversation
         const conversationsMap = new Map();
+
         for (const item of resources) {
-            const conversationId = String(item.conversationId); // ✅ normalize
+            const conversationId = String(item.conversationId);
 
             if (!conversationsMap.has(conversationId)) {
+                // First message of conversation
                 conversationsMap.set(conversationId, {
-                    userId: userId,
-                    conversationId: conversationId,
+                    userId,
+                    conversationId,
                     firstMessage: item.message,
-                    timestamp: item.timestamp
+                    timestamp: item.timestamp,
+                    totalMessages: 1
                 });
+            } else {
+                // Increment message count
+                conversationsMap.get(conversationId).totalMessages += 1;
             }
         }
 
-
         const conversations = Array.from(conversationsMap.values());
+
+        /* ================= RESPONSE ================= */
 
         context.res = {
             status: 200,
-            body: { success: true, data: conversations }
+            body: {
+                success: true,
+                data: conversations
+            }
         };
 
     } catch (err) {
-        console.error(err);
+        context.log.error(err);
         context.res = {
             status: 500,
             body: { message: "Internal server error" }
